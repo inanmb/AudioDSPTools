@@ -57,6 +57,15 @@ iPlug 2 includes the following 3rd party libraries (see each license info):
 #include <atomic>
 #include <array>
 #include <cstdlib>
+#include <type_traits>
+
+#if defined(__AVX__)
+  #include <immintrin.h>
+#elif defined(__SSE2__)
+  #include <immintrin.h>
+#elif defined(__ARM_NEON__)
+  #include <arm_neon.h>
+#endif
 
 // #include "IPlugPlatform.h"
 
@@ -74,6 +83,59 @@ enum class EAntiAliasFilterPhase
   LinearCascadedFIRShort,
   LinearCascadedFIRLong
 };
+
+// Dot product of two float arrays with SIMD acceleration (AVX / SSE2 / NEON).
+// Used for the dense FIR steady-state path in half-band decimation.
+// Requires forward-ordered coefficients (reversed vs. the standard lag-k convention)
+// and forward-ordered samples starting at (sample_ptr - numTaps + 1).
+static inline float DenseFIRDotProduct(const float* coefficients, const float* samples, size_t count)
+{
+  float result = 0.0f;
+  size_t i = 0;
+#if defined(__AVX__)
+  __m256 sum = _mm256_setzero_ps();
+  for (; i + 7 < count; i += 8)
+  {
+    const __m256 c = _mm256_loadu_ps(coefficients + i);
+    const __m256 x = _mm256_loadu_ps(samples + i);
+    sum = _mm256_add_ps(sum, _mm256_mul_ps(c, x));
+  }
+  // Horizontal reduction
+  const __m128 lo = _mm256_castps256_ps128(sum);
+  const __m128 hi = _mm256_extractf128_ps(sum, 1);
+  __m128 s4 = _mm_add_ps(lo, hi);
+  s4 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
+  s4 = _mm_add_ss(s4, _mm_shuffle_ps(s4, s4, 1));
+  result = _mm_cvtss_f32(s4);
+#elif defined(__SSE2__)
+  __m128 sum0 = _mm_setzero_ps();
+  __m128 sum1 = _mm_setzero_ps();
+  for (; i + 7 < count; i += 8)
+  {
+    sum0 = _mm_add_ps(sum0, _mm_mul_ps(_mm_loadu_ps(coefficients + i),     _mm_loadu_ps(samples + i)));
+    sum1 = _mm_add_ps(sum1, _mm_mul_ps(_mm_loadu_ps(coefficients + i + 4), _mm_loadu_ps(samples + i + 4)));
+  }
+  __m128 s4 = _mm_add_ps(sum0, sum1);
+  s4 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
+  s4 = _mm_add_ss(s4, _mm_shuffle_ps(s4, s4, 1));
+  result = _mm_cvtss_f32(s4);
+#elif defined(__ARM_NEON__)
+  float32x4_t sum0 = vdupq_n_f32(0.0f);
+  float32x4_t sum1 = vdupq_n_f32(0.0f);
+  for (; i + 7 < count; i += 8)
+  {
+    sum0 = vmlaq_f32(sum0, vld1q_f32(samples + i),     vld1q_f32(coefficients + i));
+    sum1 = vmlaq_f32(sum1, vld1q_f32(samples + i + 4), vld1q_f32(coefficients + i + 4));
+  }
+  float32x4_t s4 = vaddq_f32(sum0, sum1);
+  float32x2_t s2 = vadd_f32(vget_low_f32(s4), vget_high_f32(s4));
+  result = vget_lane_f32(vpadd_f32(s2, s2), 0);
+#endif
+  // Scalar tail (remainder after SIMD lanes)
+  for (; i < count; i++)
+    result += coefficients[i] * samples[i];
+  return result;
+}
 
 /** A multi-channel real-time resampling container that can be used to resample
  * audio processing to a specified sample rate for the situation where you have
@@ -1347,6 +1409,9 @@ int GetCascadedPrototypeNumTaps() const
       for (auto& coeff : mHalfBandCoefficients)
         coeff /= dcGain;
     }
+
+    // Reversed copy for forward-access SIMD in the decimation steady-state loop.
+    mHalfBandCoefficientsReversed.assign(mHalfBandCoefficients.rbegin(), mHalfBandCoefficients.rend());
   }
   // END NAM_OS_THREE_STRICT_BANDWIDTH_MODES
 
@@ -2130,18 +2195,24 @@ int GetCascadedHalfBandRoundTripLatency() const
 
           if (steady)
           {
-            size_t k = 0;
-
-            for (; k + 3 < numTaps; k += 4)
+            if constexpr (std::is_same_v<T, float>)
             {
-              y += mHalfBandCoefficients[k + 0] * in[s - (k + 0)];
-              y += mHalfBandCoefficients[k + 1] * in[s - (k + 1)];
-              y += mHalfBandCoefficients[k + 2] * in[s - (k + 2)];
-              y += mHalfBandCoefficients[k + 3] * in[s - (k + 3)];
+              // SIMD path: reversed coefficients + forward sample window give same dot product.
+              y = DenseFIRDotProduct(mHalfBandCoefficientsReversed.data(), &in[s - numTaps + 1], numTaps);
             }
-
-            for (; k < numTaps; k++)
-              y += mHalfBandCoefficients[k] * in[s - k];
+            else
+            {
+              size_t k = 0;
+              for (; k + 3 < numTaps; k += 4)
+              {
+                y += mHalfBandCoefficients[k + 0] * in[s - (k + 0)];
+                y += mHalfBandCoefficients[k + 1] * in[s - (k + 1)];
+                y += mHalfBandCoefficients[k + 2] * in[s - (k + 2)];
+                y += mHalfBandCoefficients[k + 3] * in[s - (k + 3)];
+              }
+              for (; k < numTaps; k++)
+                y += mHalfBandCoefficients[k] * in[s - k];
+            }
           }
           else
           {
@@ -2654,6 +2725,7 @@ void DecimateBlock(T** input, size_t nFrames, T** outputs, int maxOutputFrames)
   std::vector<T> mDecimationFirCoefficients;
   std::vector<T> mDecimationFirHistory;
   std::vector<T> mHalfBandCoefficients;
+  std::vector<T> mHalfBandCoefficientsReversed; // mHalfBandCoefficients reversed, for SIMD forward-access
   std::array<std::vector<size_t>, 2> mHalfBandPolyphaseTapIndices;
   std::array<std::vector<T>, 2> mHalfBandPolyphaseTapCoefficients;
   std::vector<T> mCascadedHalfBandHistory;
