@@ -63,7 +63,7 @@ iPlug 2 includes the following 3rd party libraries (see each license info):
   #include <immintrin.h>
 #elif defined(__SSE2__)
   #include <immintrin.h>
-#elif defined(__ARM_NEON__)
+#elif defined(__ARM_NEON__) || defined(__ARM_NEON)
   #include <arm_neon.h>
 #endif
 
@@ -119,7 +119,7 @@ static inline float DenseFIRDotProduct(const float* coefficients, const float* s
   s4 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
   s4 = _mm_add_ss(s4, _mm_shuffle_ps(s4, s4, 1));
   result = _mm_cvtss_f32(s4);
-#elif defined(__ARM_NEON__)
+#elif defined(__ARM_NEON__) || defined(__ARM_NEON)
   float32x4_t sum0 = vdupq_n_f32(0.0f);
   float32x4_t sum1 = vdupq_n_f32(0.0f);
   for (; i + 7 < count; i += 8)
